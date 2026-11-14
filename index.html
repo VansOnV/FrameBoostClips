@@ -29,6 +29,7 @@
   .bar{height:6px;background:#1c1c22;border-radius:6px;overflow:hidden;margin-top:6px}
   .bar>div{height:100%;width:0;background:var(--acc);transition:width .15s}
   #stats{font-size:13px;color:var(--dim);margin-top:8px;font-variant-numeric:tabular-nums}
+  #est{font-size:13px;margin-top:12px;color:var(--text)}
   #log{font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;color:var(--dim);max-height:140px;overflow:auto;white-space:pre-wrap}
   #result video{width:100%;border-radius:10px;background:#000;margin-top:10px}
   a.dl{display:block;text-align:center;text-decoration:none;background:var(--acc);color:#fff;border-radius:10px;padding:12px;font-weight:600}
@@ -74,6 +75,7 @@
     </div>
     <div style="margin-top:12px"><label class="f">Sharpen: <span id="shV">0.30</span></label>
       <input type="range" id="sharp" min="0" max="1" step="0.05" value="0.3"></div>
+    <div id="est"></div>
     <div class="row">
       <button id="go" disabled>Convert</button>
       <button id="stop" class="sec" disabled>Cancel</button>
@@ -115,6 +117,15 @@ if (!('VideoEncoder' in window)) {
 }
 
 $('sharp').oninput = e => $('shV').textContent = (+e.target.value).toFixed(2);
+
+function fmtSize(b){ return b >= 1073741824 ? (b / 1073741824).toFixed(2) + ' GB' : (b / 1048576).toFixed(1) + ' MB'; }
+function updateEst(){
+  if (!meta.dur) { $('est').textContent = ''; return; }
+  const mb = +$('mbps').value || 0;
+  const v = mb * 1e6 / 8 * meta.dur, a = 192000 / 8 * meta.dur;
+  $('est').textContent = `Estimated output size: up to ~${fmtSize(v + a)} (video ~${fmtSize(v)} at ${mb} Mbps + audio ~${fmtSize(a)})`;
+}
+$('mbps').oninput = updateEst;
 
 // ---------- file select ----------
 const drop = $('drop');
@@ -166,6 +177,7 @@ async function pick(f){
   }
   $('info').textContent = `${meta.w}×${meta.h} · ${meta.dur.toFixed(2)}s · ${fps ? fps + ' fps detected' : 'fps not detected, set it manually'}`;
   $('go').disabled = false;
+  updateEst();
   log('Loaded ' + f.name);
 }
 
@@ -334,24 +346,77 @@ async function settle(v){
 }
 
 // ---------- audio ----------
-async function decodeAudio(){
-  try {
-    const buf = await file.arrayBuffer();
-    const AC = window.AudioContext || window.webkitAudioContext;
-    const ac = new AC();
-    const ab = await ac.decodeAudioData(buf);
-    ac.close();
-    if (!('AudioEncoder' in window)) return null;
-    const ch = Math.min(2, ab.numberOfChannels);
-    const sup = await AudioEncoder.isConfigSupported({ codec: 'mp4a.40.2', sampleRate: ab.sampleRate, numberOfChannels: ch, bitrate: 192000 });
-    return sup.supported ? ab : null;
-  } catch (e) { return null; }
-}
-async function encodeAudio(ab, muxer){
+const AC = window.AudioContext || window.webkitAudioContext;
+async function pickAudioCodec(ab){
+  if (!('AudioEncoder' in window)) return null;
   const ch = Math.min(2, ab.numberOfChannels), sr = ab.sampleRate;
+  for (const [codec, mux] of [['mp4a.40.2', 'aac'], ['opus', 'opus']]) {
+    try {
+      const s = await AudioEncoder.isConfigSupported({ codec, sampleRate: sr, numberOfChannels: ch, bitrate: 192000 });
+      if (s.supported) return { codec, mux };
+    } catch (e) {}
+  }
+  return null;
+}
+async function decodeFromFile(){
+  const buf = await file.arrayBuffer();
+  const ac = new AC({ sampleRate: 48000 });
+  try { return await ac.decodeAudioData(buf); } finally { ac.close(); }
+}
+// Fallback: play the video muted-to-speakers and record its audio in real time.
+async function captureRealtime(){
+  if (!window.MediaRecorder || !AC) return null;
+  const v = document.createElement('video');
+  v.src = blobUrl; v.playsInline = true; v.preload = 'auto';
+  await new Promise((res, rej) => { v.onloadedmetadata = res; v.onerror = () => rej(new Error('cannot load video')); });
+  const ac = new AC({ sampleRate: 48000 });
+  const src = ac.createMediaElementSource(v);
+  const dest = ac.createMediaStreamDestination();
+  src.connect(dest);
+  const mime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'].find(m => MediaRecorder.isTypeSupported(m));
+  const rec = new MediaRecorder(dest.stream, mime ? { mimeType: mime } : undefined);
+  const chunks = [];
+  rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+  const stopped = new Promise(r => rec.onstop = r);
+  await ac.resume();
+  rec.start(500);
+  await v.play();
+  let noAudio = false;
+  await new Promise(res => {
+    const t0 = performance.now();
+    const iv = setInterval(() => {
+      const el = (performance.now() - t0) / 1000;
+      $('stats').textContent = `Capturing audio in real time… ${fmtT(v.currentTime)} / ${fmtT(meta.dur)}`;
+      if (cancelled || v.ended) { clearInterval(iv); res(); }
+      else if (el > 2 && typeof v.webkitAudioDecodedByteCount === 'number' && v.webkitAudioDecodedByteCount === 0) { noAudio = true; clearInterval(iv); res(); }
+    }, 250);
+  });
+  v.pause();
+  if (rec.state !== 'inactive') rec.stop();
+  await stopped;
+  if (noAudio || cancelled || !chunks.length) { ac.close(); return null; }
+  const ab = await ac.decodeAudioData(await new Blob(chunks).arrayBuffer());
+  ac.close();
+  return ab;
+}
+async function getAudio(){
+  let ab = null;
+  try { ab = await decodeFromFile(); log('Audio decoded from the file.'); }
+  catch (e) { log('Direct audio decode failed (' + ((e && e.message) || e) + '). Trying real-time capture…'); }
+  if (!ab && !cancelled) {
+    try { ab = await captureRealtime(); if (ab) log('Audio captured in real time.'); }
+    catch (e) { log('Real-time capture failed: ' + ((e && e.message) || e)); }
+  }
+  if (!ab) return null;
+  const enc = await pickAudioCodec(ab);
+  if (!enc) { log('This browser cannot encode AAC or Opus audio.'); return null; }
+  return { ab, codec: enc.codec, mux: enc.mux };
+}
+async function encodeAudio(a, muxer){
+  const ab = a.ab, ch = Math.min(2, ab.numberOfChannels), sr = ab.sampleRate;
   let err = null;
   const aenc = new AudioEncoder({ output: (c, m) => muxer.addAudioChunk(c, m), error: e => err = e });
-  aenc.configure({ codec: 'mp4a.40.2', sampleRate: sr, numberOfChannels: ch, bitrate: 192000 });
+  aenc.configure({ codec: a.codec, sampleRate: sr, numberOfChannels: ch, bitrate: 192000 });
   const chans = []; for (let c = 0; c < ch; c++) chans.push(ab.getChannelData(c));
   for (let s = 0; s < ab.length; s += sr) {
     if (err) throw err;
@@ -363,6 +428,7 @@ async function encodeAudio(ab, muxer){
     while (aenc.encodeQueueSize > 8) await sleep(2);
   }
   await aenc.flush(); aenc.close();
+  if (err) throw err;
 }
 
 // ---------- main ----------
@@ -402,19 +468,22 @@ async function run(){
     if (!codec) throw new Error('No supported H.264 encoder configuration for this size.');
     log('Encoder: ' + codec);
 
-    const audioBuf = await decodeAudio();
-    log(audioBuf ? 'Audio track found, will be re-encoded as AAC.' : 'No usable audio, output will be silent.');
+    $('stats').textContent = 'Preparing audio…';
+    const aud = await getAudio();
+    if (cancelled) { log('Cancelled.'); return; }
+    log(aud ? 'Audio ready, will be encoded as ' + aud.mux.toUpperCase() + '.' : 'No usable audio, output will have no sound.');
 
     const target = new Mp4Muxer.ArrayBufferTarget();
     const muxer = new Mp4Muxer.Muxer({
       target,
       video: { codec: 'avc', width: outW, height: outH, frameRate: outFps },
-      audio: audioBuf ? { codec: 'aac', numberOfChannels: Math.min(2, audioBuf.numberOfChannels), sampleRate: audioBuf.sampleRate } : undefined,
+      audio: aud ? { codec: aud.mux, numberOfChannels: Math.min(2, aud.ab.numberOfChannels), sampleRate: aud.ab.sampleRate } : undefined,
       fastStart: 'in-memory',
       firstTimestampBehavior: 'offset'
     });
-    let encErr = null;
-    const venc = new VideoEncoder({ output: (c, m) => muxer.addVideoChunk(c, m), error: e => encErr = e });
+    let encErr = null, outBytes = 0;
+    const audioEst = 192000 / 8 * meta.dur;
+    const venc = new VideoEncoder({ output: (c, m) => { outBytes += c.byteLength; muxer.addVideoChunk(c, m); }, error: e => encErr = e });
     venc.configure({ codec, width: outW, height: outH, bitrate, framerate: outFps, latencyMode: 'quality' });
 
     // GL
@@ -497,7 +566,7 @@ async function run(){
         lastUi = now;
         const done = k + 1, el = (now - t0) / 1000, rate = done / el;
         $('prog').style.width = (done / nOut * 100).toFixed(1) + '%';
-        $('stats').textContent = `${done}/${nOut} frames · ${rate.toFixed(1)} fps · ${fmtT(el)} elapsed · ~${fmtT((nOut - done) / rate)} left`;
+        $('stats').textContent = `${done}/${nOut} frames · ${rate.toFixed(1)} fps · ${fmtT(el)} elapsed · ~${fmtT((nOut - done) / rate)} left · size ~${fmtSize(outBytes / done * nOut + (aud ? audioEst : 0))}`;
       }
     }
 
@@ -507,7 +576,7 @@ async function run(){
     } else {
       await venc.flush(); venc.close();
       if (encErr) throw encErr;
-      if (audioBuf) { $('stats').textContent = 'Encoding audio…'; await encodeAudio(audioBuf, muxer); }
+      if (aud) { $('stats').textContent = 'Encoding audio…'; await encodeAudio(aud, muxer); }
       muxer.finalize();
       const blob = new Blob([target.buffer], { type: 'video/mp4' });
       const name = file.name.replace(/\.[^.]+$/, '') + `_${outH}p_${Math.round(outFps)}fps.mp4`;
