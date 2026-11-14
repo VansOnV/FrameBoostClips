@@ -112,6 +112,7 @@ const muxerReady = (async () => {
   return false;
 })();
 
+log('Frame Boost v4 loaded.');
 const mp4boxReady = (async () => {
   const urls = [
     'https://cdn.jsdelivr.net/npm/mp4box@0.5.2/dist/mp4box.all.min.js',
@@ -539,11 +540,34 @@ async function run(){
       fastStart: 'in-memory',
       firstTimestampBehavior: 'offset'
     });
-    if (aud && aud.mode === 'copy') {
-      aud.samples.forEach((x, i) => {
-        const meta = i === 0 ? { decoderConfig: { codec: aud.codec, numberOfChannels: aud.channels, sampleRate: aud.sampleRate, description: aud.desc } } : undefined;
-        muxer.addAudioChunkRaw(x.data, x.key ? 'key' : 'delta', Math.round(x.ts), Math.round(x.dur), meta);
-      });
+    // Audio is fed in step with the video so the MP4 is properly interleaved.
+    let audioIdx = 0, audioPos = 0, aenc = null, aErr = null;
+    if (aud && aud.mode === 'encode') {
+      aenc = new AudioEncoder({ output: (c, m) => muxer.addAudioChunk(c, m), error: e => aErr = e });
+      aenc.configure({ codec: aud.codec, sampleRate: aud.sampleRate, numberOfChannels: aud.channels, bitrate: 192000 });
+    }
+    async function pumpAudio(uptoUs){
+      if (!aud) return;
+      if (aud.mode === 'copy') {
+        while (audioIdx < aud.samples.length && aud.samples[audioIdx].ts <= uptoUs) {
+          const x = aud.samples[audioIdx];
+          const m = audioIdx === 0 ? { decoderConfig: { codec: aud.codec, numberOfChannels: aud.channels, sampleRate: aud.sampleRate, description: aud.desc } } : undefined;
+          muxer.addAudioChunkRaw(x.data, x.key ? 'key' : 'delta', Math.round(x.ts), Math.round(x.dur), m);
+          audioIdx++;
+        }
+      } else {
+        const sr = aud.sampleRate, ab = aud.ab, ch = aud.channels;
+        while (audioPos < ab.length && audioPos / sr * 1e6 <= uptoUs) {
+          if (aErr) throw aErr;
+          const n = Math.min(sr >> 1, ab.length - audioPos);
+          const data = new Float32Array(n * ch);
+          for (let c = 0; c < ch; c++) data.set(ab.getChannelData(c).subarray(audioPos, audioPos + n), c * n);
+          const ad = new AudioData({ format: 'f32-planar', sampleRate: sr, numberOfFrames: n, numberOfChannels: ch, timestamp: Math.round(audioPos / sr * 1e6), data });
+          aenc.encode(ad); ad.close();
+          audioPos += n;
+          while (aenc.encodeQueueSize > 8) await sleep(2);
+        }
+      }
     }
     let encErr = null, outBytes = 0;
     const audioEst = 192000 / 8 * meta.dur;
@@ -624,6 +648,7 @@ async function run(){
       venc.encode(frame, { keyFrame: k % 120 === 0 });
       frame.close();
       while (venc.encodeQueueSize > 6) { if (encErr) throw encErr; await sleep(3); }
+      await pumpAudio(k * 1e6 / outFps + 300000);
 
       const now = performance.now();
       if (now - lastUi > 150 || k === nOut - 1) {
@@ -636,11 +661,13 @@ async function run(){
 
     if (cancelled) {
       try { venc.close(); } catch(e){}
+      try { if (aenc) aenc.close(); } catch(e){}
       log('Cancelled.');
     } else {
       await venc.flush(); venc.close();
       if (encErr) throw encErr;
-      if (aud && aud.mode === 'encode') { $('stats').textContent = 'Encoding audio…'; await encodeAudio(aud, muxer); }
+      await pumpAudio(Infinity);
+      if (aenc) { await aenc.flush(); aenc.close(); if (aErr) throw aErr; }
       muxer.finalize();
       const blob = new Blob([target.buffer], { type: 'video/mp4' });
       const name = file.name.replace(/\.[^.]+$/, '') + `_${outH}p_${Math.round(outFps)}fps.mp4`;
