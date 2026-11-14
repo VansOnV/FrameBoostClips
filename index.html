@@ -116,7 +116,7 @@ const muxerReady = (async () => {
   return false;
 })();
 
-log('Frame Boost v5 loaded.');
+log('Frame Boost v6 loaded.');
 const mp4boxReady = (async () => {
   const urls = [
     'https://cdn.jsdelivr.net/npm/mp4box@0.5.2/dist/mp4box.all.min.js',
@@ -450,8 +450,26 @@ async function passthroughAudio(src){
       if (!/^mp4a/.test(track.codec) || /^mp4a\.(?!40)/.test(track.codec)) return rej(new Error('audio codec is ' + track.codec + ', not AAC'));
       try {
         const trak = mp4.getTrackById(track.id);
-        desc = trak.mdia.minf.stbl.stsd.entries[0].esds.esd.descs[0].descs[0].data;
-      } catch (e) { return rej(new Error('could not read AAC config')); }
+        const find = (o, d) => {
+          if (!o || typeof o !== 'object' || d > 6) return null;
+          if (o.type === 'esds' && o.esd) return o;
+          for (const k in o) {
+            if (k === 'parent' || k === 'data') continue;
+            const r = find(o[k], d + 1);
+            if (r) return r;
+          }
+          return null;
+        };
+        const esds = find(trak.mdia.minf.stbl.stsd.entries[0], 0);
+        if (esds) desc = esds.esd.descs[0].descs[0].data;
+      } catch (e) { desc = null; }
+      if (!desc) {
+        // QuickTime .mov files often hide the AAC config. Build the standard 2-byte AAC-LC config instead.
+        const rates = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+        const fi = rates.indexOf(track.audio.sample_rate), ch = track.audio.channel_count;
+        if (fi < 0 || ch < 1 || ch > 7) return rej(new Error('could not read AAC config'));
+        desc = new Uint8Array([(2 << 3) | (fi >> 1), ((fi & 1) << 7) | (ch << 3)]);
+      }
       { const aot = desc[0] >> 3; aacCodec = 'mp4a.40.' + (aot >= 1 && aot <= 29 ? aot : 2); }
       mp4.setExtractionOptions(track.id, null, { nbSamples: 2000 });
       mp4.start();
