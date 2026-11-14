@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="icon-512.png" alt="Frame Boost logo" width="120">
+
 # Frame Boost
 
 **Turn 30 fps into real 60 fps and upscale 720p to 1080p, right in your browser.**
@@ -28,6 +30,8 @@ Frame Boost takes a video and gives you back a smoother, sharper one.
 - **Upscaling.** 720p to 1080p, with options for 1440p and 4K. It uses bicubic resampling with an adjustable sharpen control.
 - **Your audio, untouched.** The original AAC track is copied straight into the new file with no re-encoding, so quality and sync stay exactly as they were.
 - **Fully private.** Everything runs locally using your GPU and your browser's built-in video encoder. There is no server, no account and no upload.
+- **Install it like an app.** Add it to your home screen and it opens full screen with its own icon. After the first visit it also loads offline.
+- **Built for long runs.** While converting it keeps your screen awake, shows progress in the tab title, and sends a notification when your video is ready.
 - **Live size estimate.** See roughly how big the output will be before you start, and a running projection while it converts.
 
 ## Quick start
@@ -63,6 +67,13 @@ Frame Boost takes a video and gives you back a smoother, sharper one.
 | Sharpen | Adjustable edge sharpening applied during upscaling. |
 | Audio file (optional) | Supply an `.m4a`, `.aac`, `.mp3` or `.wav` to use instead of the video's own audio. |
 
+## Install on your phone
+
+- **Android (Chrome):** open the site, tap **Install app** at the top of the page, or use the browser menu and choose **Add to Home screen**.
+- **Desktop (Chrome / Edge):** click the install icon in the address bar.
+
+Then launch it from your home screen like any other app.
+
 ## Requirements
 
 - A recent **Chrome or Edge**, on desktop or Android. Frame Boost relies on the WebCodecs API for encoding.
@@ -71,6 +82,7 @@ Frame Boost takes a video and gives you back a smoother, sharper one.
 
 ## Good to know
 
+- Keep the page open while it converts. Browsers can pause pages that are in the background, so Frame Boost keeps the screen awake and plays an inaudible tone to reduce that, but a phone can still stop it if it runs low on memory or battery.
 - Processing happens frame by frame in the browser, so long or very high-resolution videos take time and memory. Short clips are the sweet spot.
 - Interpolation works best on footage with smooth, steady motion. Fast, chaotic movement or heavy motion blur can produce visible artefacts.
 - Copying the original audio works with AAC audio in MP4 and MOV files. For other audio, Frame Boost re-encodes it, or you can supply an `.m4a` for the fastest result.

@@ -4,11 +4,25 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Frame Boost</title>
+<meta name="theme-color" content="#0b0b0d">
+<meta name="description" content="Convert 30 fps video to 60 fps and upscale to 1080p, right in your browser.">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/svg+xml" href="icon.svg">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Frame Boost">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <style>
   :root{--bg:#0b0b0d;--panel:#131316;--line:#25252b;--text:#e9e9ec;--dim:#8b8b95;--acc:#5b8cff}
   *{box-sizing:border-box}
   html,body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
   main{max-width:680px;margin:0 auto;padding:28px 18px 60px}
+  .top{display:flex;align-items:center;gap:12px;margin-bottom:22px}
+  .top img{border-radius:10px;flex:none}
+  .top .sub{margin:0}
+  .top h1{margin:0 0 2px}
+  #install{flex:none;width:auto;margin-left:auto;padding:8px 12px;font-size:13px}
   h1{font-size:22px;font-weight:600;margin:0 0 4px;letter-spacing:-.01em}
   .sub{color:var(--dim);margin:0 0 22px;font-size:14px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:14px}
@@ -40,8 +54,12 @@
 </head>
 <body>
 <main>
-  <h1>Frame Boost</h1>
-  <p class="sub">Frame interpolation and upscaling, in your browser. Nothing is uploaded anywhere.</p>
+  <header class="top">
+    <img src="icon-192.png" alt="" width="46" height="46">
+    <div><h1>Frame Boost</h1>
+    <p class="sub">Frame interpolation and upscaling, in your browser. Nothing is uploaded anywhere.</p></div>
+    <button id="install" class="sec hide">Install app</button>
+  </header>
 
   <label class="drop" id="drop">
     <input type="file" id="file" accept="video/*">
@@ -86,6 +104,7 @@
     </div>
     <div class="bar"><div id="prog"></div></div>
     <div id="stats"></div>
+    <div class="sub" style="font-size:12px;margin:8px 0 0">Tip: leave this page open while it converts. It keeps your screen awake and sends a notification when it finishes.</div>
   </div>
 
   <div class="card hide" id="resultCard"><div id="result"></div></div>
@@ -116,7 +135,7 @@ const muxerReady = (async () => {
   return false;
 })();
 
-log('Frame Boost v6 loaded.');
+log('Frame Boost v7 loaded.');
 const mp4boxReady = (async () => {
   const urls = [
     'https://cdn.jsdelivr.net/npm/mp4box@0.5.2/dist/mp4box.all.min.js',
@@ -136,6 +155,57 @@ if (!('VideoEncoder' in window)) {
 }
 
 $('sharp').oninput = e => $('shV').textContent = (+e.target.value).toFixed(2);
+
+// ---------- background support ----------
+const BASE_TITLE = document.title;
+let wakeLock = null, kaCtx = null, kaOsc = null;
+async function startKeepAlive(){
+  try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+  try {
+    // A silent, inaudible tone stops the browser from throttling or freezing the tab while it works.
+    const AC2 = window.AudioContext || window.webkitAudioContext;
+    if (!kaCtx) kaCtx = new AC2();
+    await kaCtx.resume();
+    kaOsc = kaCtx.createOscillator();
+    const g = kaCtx.createGain(); g.gain.value = 0.0005; kaOsc.frequency.value = 30;
+    kaOsc.connect(g); g.connect(kaCtx.destination); kaOsc.start();
+  } catch (e) {}
+}
+function stopKeepAlive(){
+  try { if (wakeLock) wakeLock.release(); } catch (e) {} wakeLock = null;
+  try { if (kaOsc) kaOsc.stop(); } catch (e) {} kaOsc = null;
+  document.title = BASE_TITLE;
+}
+async function notify(title, body){
+  try {
+    if (!('Notification' in window) || Notification.permission !== 'granted' || !document.hidden) return;
+    const opts = { body, icon: 'icon-192.png', badge: 'icon-192.png', tag: 'frameboost' };
+    if ('serviceWorker' in navigator) {
+      const reg = await navigator.serviceWorker.getRegistration();
+      if (reg) { await reg.showNotification(title, opts); return; }
+    }
+    new Notification(title, opts);
+  } catch (e) {}
+  try { if (navigator.vibrate) navigator.vibrate([120, 60, 120]); } catch (e) {}
+}
+document.addEventListener('visibilitychange', async () => {
+  if (running && document.visibilityState === 'visible' && 'wakeLock' in navigator) {
+    try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+  }
+});
+window.addEventListener('beforeunload', e => { if (running) { e.preventDefault(); e.returnValue = ''; } });
+
+// ---------- install as app ----------
+let deferredInstall = null;
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); deferredInstall = e; $('install').classList.remove('hide'); });
+$('install').onclick = async () => {
+  if (!deferredInstall) return;
+  deferredInstall.prompt();
+  try { await deferredInstall.userChoice; } catch (e) {}
+  deferredInstall = null; $('install').classList.add('hide');
+};
+window.addEventListener('appinstalled', () => $('install').classList.add('hide'));
+if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
 
 function fmtSize(b){ return b >= 1073741824 ? (b / 1073741824).toFixed(2) + ' GB' : (b / 1048576).toFixed(1) + ' MB'; }
 function updateEst(){
@@ -683,6 +753,7 @@ async function run(){
         lastUi = now;
         const done = k + 1, el = (now - t0) / 1000, rate = done / el;
         $('prog').style.width = (done / nOut * 100).toFixed(1) + '%';
+        document.title = Math.round(done / nOut * 100) + '% · Frame Boost';
         $('stats').textContent = `${done}/${nOut} frames · ${rate.toFixed(1)} fps · ${fmtT(el)} elapsed · ~${fmtT((nOut - done) / rate)} left · size ~${fmtSize(outBytes / done * nOut + (aud ? audioEst : 0))}`;
       }
     }
@@ -709,6 +780,7 @@ async function run(){
       $('result').append(a, note, pv);
       $('resultCard').classList.remove('hide');
       log(`Done in ${fmtT((performance.now() - t0) / 1000)}.`);
+      notify('Frame Boost', 'Your video is ready to download.');
     }
     const ext = gl.getExtension('WEBGL_lose_context'); if (ext) ext.loseContext();
   } catch (e) {
@@ -716,10 +788,15 @@ async function run(){
     log('Error: ' + (e && e.message ? e.message : e));
   } finally {
     running = false;
+    stopKeepAlive();
     $('go').disabled = false; $('stop').disabled = true;
   }
 }
-$('go').onclick = run;
+$('go').onclick = () => {
+  try { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission(); } catch (e) {}
+  startKeepAlive();
+  run();
+};
 $('stop').onclick = () => { cancelled = true; };
 })();
 </script>
