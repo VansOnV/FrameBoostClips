@@ -20,6 +20,7 @@
   @media(max-width:480px){.grid{grid-template-columns:1fr}}
   label.f{display:block;font-size:12px;color:var(--dim);margin-bottom:4px}
   input[type=number],select{width:100%;background:#0e0e11;border:1px solid var(--line);color:var(--text);border-radius:9px;padding:9px 10px;font:inherit}
+  input[type=file]{color:var(--dim);font:inherit;font-size:13px;width:100%}
   input[type=range]{width:100%;accent-color:var(--acc)}
   .row{display:flex;gap:10px;margin-top:14px}
   button{flex:1;border:0;border-radius:10px;padding:12px;font:inherit;font-weight:600;cursor:pointer;background:var(--acc);color:#fff;transition:opacity .15s,transform .1s}
@@ -75,6 +76,9 @@
     </div>
     <div style="margin-top:12px"><label class="f">Sharpen: <span id="shV">0.30</span></label>
       <input type="range" id="sharp" min="0" max="1" step="0.05" value="0.3"></div>
+    <div style="margin-top:12px"><label class="f">Audio file (optional: .m4a, .aac, .mp3, .wav). Replaces the video's own audio and is much faster if the video's audio can't be copied.</label>
+      <input type="file" id="audioFile" accept="audio/*,.m4a,.aac"></div>
+    <label class="f" style="margin-top:10px;display:flex;gap:8px;align-items:center"><input type="checkbox" id="rtCap"> Allow slow real-time audio capture if everything else fails</label>
     <div id="est"></div>
     <div class="row">
       <button id="go" disabled>Convert</button>
@@ -112,7 +116,7 @@ const muxerReady = (async () => {
   return false;
 })();
 
-log('Frame Boost v4 loaded.');
+log('Frame Boost v5 loaded.');
 const mp4boxReady = (async () => {
   const urls = [
     'https://cdn.jsdelivr.net/npm/mp4box@0.5.2/dist/mp4box.all.min.js',
@@ -373,8 +377,8 @@ async function pickAudioCodec(ab){
   }
   return null;
 }
-async function decodeFromFile(){
-  const buf = await file.arrayBuffer();
+async function decodeFromFile(src){
+  const buf = await src.arrayBuffer();
   const ac = new AC({ sampleRate: 48000 });
   try { return await ac.decodeAudioData(buf); } finally { ac.close(); }
 }
@@ -414,11 +418,13 @@ async function captureRealtime(){
   ac.close();
   return ab;
 }
-async function getAudioEncoded(){
+async function getAudioEncoded(src){
   let ab = null;
-  try { ab = await decodeFromFile(); log('Audio decoded from the file.'); }
+  try { ab = await decodeFromFile(src); log('Audio decoded from the file.'); }
   catch (e) { log('Direct audio decode failed (' + ((e && e.message) || e) + '). Trying real-time capture…'); }
-  if (!ab && !cancelled) {
+  if (!ab && !cancelled && src !== file) log('Could not read the audio file you chose.');
+  else if (!ab && !cancelled && !$('rtCap').checked) log('Skipping slow real-time capture. Tip: pick an .m4a of the audio in the "Audio file" box, or tick the real-time option.');
+  if (!ab && !cancelled && src === file && $('rtCap').checked) {
     try { ab = await captureRealtime(); if (ab) log('Audio captured in real time.'); }
     catch (e) { log('Real-time capture failed: ' + ((e && e.message) || e)); }
   }
@@ -428,23 +434,24 @@ async function getAudioEncoded(){
   return { mode: 'encode', ab, codec: enc.codec, mux: enc.mux, channels: Math.min(2, ab.numberOfChannels), sampleRate: ab.sampleRate };
 }
 // Best path: copy the original AAC stream out of the source MP4/MOV untouched.
-async function passthroughAudio(){
+async function passthroughAudio(src){
   if (!(await mp4boxReady) || !window.MP4Box) throw new Error('demuxer library did not load');
-  const buf = await file.arrayBuffer();
+  const buf = await src.arrayBuffer();
   return await new Promise((res, rej) => {
     const mp4 = MP4Box.createFile();
-    let ready = false, track = null, desc = null;
+    let ready = false, track = null, desc = null, aacCodec = 'mp4a.40.2';
     const samples = [];
     mp4.onError = e => rej(new Error('demux error: ' + e));
     mp4.onReady = info => {
       ready = true;
       track = info.audioTracks && info.audioTracks[0];
       if (!track) return;
-      if (!/^mp4a\.40/.test(track.codec)) return rej(new Error('audio codec is ' + track.codec + ', not AAC'));
+      if (!/^mp4a/.test(track.codec) || /^mp4a\.(?!40)/.test(track.codec)) return rej(new Error('audio codec is ' + track.codec + ', not AAC'));
       try {
         const trak = mp4.getTrackById(track.id);
         desc = trak.mdia.minf.stbl.stsd.entries[0].esds.esd.descs[0].descs[0].data;
       } catch (e) { return rej(new Error('could not read AAC config')); }
+      { const aot = desc[0] >> 3; aacCodec = 'mp4a.40.' + (aot >= 1 && aot <= 29 ? aot : 2); }
       mp4.setExtractionOptions(track.id, null, { nbSamples: 2000 });
       mp4.start();
     };
@@ -457,19 +464,21 @@ async function passthroughAudio(){
     if (!ready) return rej(new Error('not an MP4/MOV container'));
     if (!track) return res('none');
     if (!desc || !samples.length) return rej(new Error('no audio samples found'));
-    res({ mode: 'copy', mux: 'aac', codec: track.codec, channels: track.audio.channel_count, sampleRate: track.audio.sample_rate, desc, samples });
+    res({ mode: 'copy', mux: 'aac', codec: aacCodec, channels: track.audio.channel_count, sampleRate: track.audio.sample_rate, desc, samples });
   });
 }
 async function getAudio(){
+  const src = $('audioFile').files[0] || file;
+  if (src !== file) log('Using audio from ' + src.name);
   try {
-    const p = await passthroughAudio();
+    const p = await passthroughAudio(src);
     if (p === 'none') { log('Source has no audio track.'); return null; }
     log('Found original AAC audio (' + p.samples.length + ' packets).');
     return p;
   } catch (e) {
     log('Cannot copy original audio (' + ((e && e.message) || e) + '). Re-encoding instead…');
   }
-  return getAudioEncoded();
+  return getAudioEncoded(src);
 }
 async function encodeAudio(a, muxer){
   const ab = a.ab, ch = Math.min(2, ab.numberOfChannels), sr = ab.sampleRate;
