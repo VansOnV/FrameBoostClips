@@ -190,8 +190,9 @@ async function pick(f){
   meta = { w: video.videoWidth, h: video.videoHeight, dur: video.duration };
   let fps = await detectFps(video);
   if (fps) {
-    const near = COMMON.find(c => Math.abs(c - fps) < 0.35);
-    fps = near || Math.round(fps * 100) / 100;
+    const near = COMMON.reduce((b, c) => Math.abs(c - fps) < Math.abs(b - fps) ? c : b, COMMON[0]);
+    const isNear = Math.abs(near - fps) < 0.35;
+    fps = isNear ? near : Math.round(fps * 100) / 100;
     $('srcFps').value = fps;
   }
   $('info').textContent = `${meta.w}×${meta.h} · ${meta.dur.toFixed(2)}s · ${fps ? fps + ' fps detected' : 'fps not detected, set it manually'}`;
