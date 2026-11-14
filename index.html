@@ -112,6 +112,20 @@ const muxerReady = (async () => {
   return false;
 })();
 
+const mp4boxReady = (async () => {
+  const urls = [
+    'https://cdn.jsdelivr.net/npm/mp4box@0.5.2/dist/mp4box.all.min.js',
+    'https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js'
+  ];
+  for (const u of urls) {
+    try {
+      await new Promise((res, rej) => { const s = document.createElement('script'); s.src = u; s.onload = res; s.onerror = rej; document.head.appendChild(s); });
+      if (window.MP4Box) return true;
+    } catch (e) {}
+  }
+  return false;
+})();
+
 if (!('VideoEncoder' in window)) {
   $('support').textContent = 'This browser has no WebCodecs encoder. Use recent Chrome or Edge (desktop or Android).';
 }
@@ -399,7 +413,7 @@ async function captureRealtime(){
   ac.close();
   return ab;
 }
-async function getAudio(){
+async function getAudioEncoded(){
   let ab = null;
   try { ab = await decodeFromFile(); log('Audio decoded from the file.'); }
   catch (e) { log('Direct audio decode failed (' + ((e && e.message) || e) + '). Trying real-time capture…'); }
@@ -410,7 +424,51 @@ async function getAudio(){
   if (!ab) return null;
   const enc = await pickAudioCodec(ab);
   if (!enc) { log('This browser cannot encode AAC or Opus audio.'); return null; }
-  return { ab, codec: enc.codec, mux: enc.mux };
+  return { mode: 'encode', ab, codec: enc.codec, mux: enc.mux, channels: Math.min(2, ab.numberOfChannels), sampleRate: ab.sampleRate };
+}
+// Best path: copy the original AAC stream out of the source MP4/MOV untouched.
+async function passthroughAudio(){
+  if (!(await mp4boxReady) || !window.MP4Box) throw new Error('demuxer library did not load');
+  const buf = await file.arrayBuffer();
+  return await new Promise((res, rej) => {
+    const mp4 = MP4Box.createFile();
+    let ready = false, track = null, desc = null;
+    const samples = [];
+    mp4.onError = e => rej(new Error('demux error: ' + e));
+    mp4.onReady = info => {
+      ready = true;
+      track = info.audioTracks && info.audioTracks[0];
+      if (!track) return;
+      if (!/^mp4a\.40/.test(track.codec)) return rej(new Error('audio codec is ' + track.codec + ', not AAC'));
+      try {
+        const trak = mp4.getTrackById(track.id);
+        desc = trak.mdia.minf.stbl.stsd.entries[0].esds.esd.descs[0].descs[0].data;
+      } catch (e) { return rej(new Error('could not read AAC config')); }
+      mp4.setExtractionOptions(track.id, null, { nbSamples: 2000 });
+      mp4.start();
+    };
+    mp4.onSamples = (id, u, ss) => {
+      for (const x of ss) samples.push({ data: x.data, ts: x.cts / x.timescale * 1e6, dur: x.duration / x.timescale * 1e6, key: x.is_sync });
+    };
+    buf.fileStart = 0;
+    mp4.appendBuffer(buf);
+    mp4.flush();
+    if (!ready) return rej(new Error('not an MP4/MOV container'));
+    if (!track) return res('none');
+    if (!desc || !samples.length) return rej(new Error('no audio samples found'));
+    res({ mode: 'copy', mux: 'aac', codec: track.codec, channels: track.audio.channel_count, sampleRate: track.audio.sample_rate, desc, samples });
+  });
+}
+async function getAudio(){
+  try {
+    const p = await passthroughAudio();
+    if (p === 'none') { log('Source has no audio track.'); return null; }
+    log('Found original AAC audio (' + p.samples.length + ' packets).');
+    return p;
+  } catch (e) {
+    log('Cannot copy original audio (' + ((e && e.message) || e) + '). Re-encoding instead…');
+  }
+  return getAudioEncoded();
 }
 async function encodeAudio(a, muxer){
   const ab = a.ab, ch = Math.min(2, ab.numberOfChannels), sr = ab.sampleRate;
@@ -471,16 +529,22 @@ async function run(){
     $('stats').textContent = 'Preparing audio…';
     const aud = await getAudio();
     if (cancelled) { log('Cancelled.'); return; }
-    log(aud ? 'Audio ready, will be encoded as ' + aud.mux.toUpperCase() + '.' : 'No usable audio, output will have no sound.');
+    log(aud ? (aud.mode === 'copy' ? 'Original audio will be copied untouched.' : 'Audio will be re-encoded as ' + aud.mux.toUpperCase() + '.') : 'WARNING: no usable audio, output will have no sound.');
 
     const target = new Mp4Muxer.ArrayBufferTarget();
     const muxer = new Mp4Muxer.Muxer({
       target,
       video: { codec: 'avc', width: outW, height: outH, frameRate: outFps },
-      audio: aud ? { codec: aud.mux, numberOfChannels: Math.min(2, aud.ab.numberOfChannels), sampleRate: aud.ab.sampleRate } : undefined,
+      audio: aud ? { codec: aud.mux, numberOfChannels: aud.channels, sampleRate: aud.sampleRate } : undefined,
       fastStart: 'in-memory',
       firstTimestampBehavior: 'offset'
     });
+    if (aud && aud.mode === 'copy') {
+      aud.samples.forEach((x, i) => {
+        const meta = i === 0 ? { decoderConfig: { codec: aud.codec, numberOfChannels: aud.channels, sampleRate: aud.sampleRate, description: aud.desc } } : undefined;
+        muxer.addAudioChunkRaw(x.data, x.key ? 'key' : 'delta', Math.round(x.ts), Math.round(x.dur), meta);
+      });
+    }
     let encErr = null, outBytes = 0;
     const audioEst = 192000 / 8 * meta.dur;
     const venc = new VideoEncoder({ output: (c, m) => { outBytes += c.byteLength; muxer.addVideoChunk(c, m); }, error: e => encErr = e });
@@ -576,7 +640,7 @@ async function run(){
     } else {
       await venc.flush(); venc.close();
       if (encErr) throw encErr;
-      if (aud) { $('stats').textContent = 'Encoding audio…'; await encodeAudio(aud, muxer); }
+      if (aud && aud.mode === 'encode') { $('stats').textContent = 'Encoding audio…'; await encodeAudio(aud, muxer); }
       muxer.finalize();
       const blob = new Blob([target.buffer], { type: 'video/mp4' });
       const name = file.name.replace(/\.[^.]+$/, '') + `_${outH}p_${Math.round(outFps)}fps.mp4`;
@@ -585,7 +649,9 @@ async function run(){
       const a = document.createElement('a'); a.className = 'dl'; a.href = url; a.download = name;
       a.textContent = `Download ${name} (${(blob.size / 1048576).toFixed(1)} MB)`;
       const pv = document.createElement('video'); pv.src = url; pv.controls = true; pv.playsInline = true;
-      $('result').append(a, pv);
+      const note = document.createElement('div'); note.className = 'sub'; note.style.marginTop = '8px';
+      note.textContent = aud ? (aud.mode === 'copy' ? 'Audio: original track copied untouched.' : 'Audio: re-encoded as ' + aud.mux.toUpperCase() + '.') : 'Audio: none (see log).';
+      $('result').append(a, note, pv);
       $('resultCard').classList.remove('hide');
       log(`Done in ${fmtT((performance.now() - t0) / 1000)}.`);
     }
